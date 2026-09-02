@@ -1,0 +1,33 @@
+# ============================================================
+# Voice Material Preprocess - dependencies (fresh-install reference)
+# ============================================================
+# Recommended: copy the author's portable runtime folder "runtime\py312"
+# (all deps locked in, incl. torch/speechbrain/pymss/funasr, ~9.4GB).
+# In that case this file is NOT needed.
+#
+# This file is only a reference for installing on a brand-new machine
+# with a system Python. Versions follow official latest stable releases.
+# Install torch / torchaudio with the CUDA command from
+# https://pytorch.org/get-started/locally/ (on Windows "pip install torch"
+# ships a CUDA 12.x build by default). Without a GPU the service
+# automatically falls back to CPU (slower but usable).
+# Requires Python 3.10+ (author used 3.12). You also need ffmpeg/ffprobe
+# on PATH, or unzipped into project "ffmpeg\bin\" (start scripts add it
+# to PATH automatically).
+
+# ---- Main service (pre_service\preprocess_api.py) direct deps ----
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9      # FastAPI multipart upload parsing
+numpy>=1.26
+soundfile>=0.12
+librosa>=0.10.2
+torch>=2.7.1                 # pymss requires torch>=2.7.1
+torchaudio>=2.7.1
+pymss==2.0.14                # music/vocal separation engine (github.com/pymss-project/pymss)
+speechbrain>=1.1.0           # ECAPA speaker recognition ("keep main speaker")
+praat-parselmouth>=0.4.4     # pitch detection ("remove applause/cheers")
+
+# ---- Optional feature: speech-to-text (ASR) ----
+funasr>=1.4.0                # SenseVoice inference framework
+modelscope>=1.30             # only needed by tests\download_asr_model.py
