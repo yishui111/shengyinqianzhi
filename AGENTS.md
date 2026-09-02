@@ -47,3 +47,9 @@
 ## 维护
 
 - 活文档：重复踩坑就补规则；每次优化/修复后同步更新 `DEPLOY.md` 与 `部署方案.md`。
+---
+### 关键点（2026-09-02 上传整理补充）
+- pre_service = 自研 FastAPI（端口 8070），tests 为自研（测试需自备音频）
+- 大件不入库：runtime\py312(便携Python ~9.4GB)、ffmpeg(~0.2GB)、models\pymss(~1.1GB)/speaker/asr(~1GB)；获取方式在 DEPLOY
+- 一键启动/关闭 bat 已规范 ASCII/CRLF；无 runtime 时 start.bat 报错属预期（提示就位）
+- requirements.txt 为全新安装参考清单（原工程无）；torch/pymss 安装注意见文件注释
