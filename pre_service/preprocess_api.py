@@ -67,6 +67,7 @@ HF_CACHE_DIR = _first_existing(
 VOCAL_MODEL = "bs_roformer_voc_hyperacev2"
 DEREVERB_MODEL = "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt"
 PORT = int(os.environ.get("PRE_PORT", "8070"))
+HOST = os.environ.get("PRE_HOST", "127.0.0.1")  # 默认只绑本机：素材不出这台电脑，局域网访问不到
 INPUT_ROOT = os.path.join(PROJECT_ROOT, "ziliao", "input")
 OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "ziliao", "output")
 MERGED_ROOT = os.path.join(OUTPUT_ROOT, "merged")  # 「合成一个音频」输出目录
@@ -175,12 +176,13 @@ def duration_sec(path):
 
 def extract_audio(src, dst_wav):
     """任意音频/视频 -> 44.1k 单声道 wav"""
-    subprocess.run([FFMPEG, "-y", "-i", src, "-ar", "44100", "-ac", "1", dst_wav],
+    subprocess.run([FFMPEG, "-y", "-i", src, "-vn", "-ar", "44100", "-ac", "1", dst_wav],
                    check=True, capture_output=True)
 
 
 def voice_segments(y, sr, min_dur=MIN_DUR, max_dur=MAX_DUR, silence_gap=0.45):
-    """基于能量切出连续语音段：静音超 0.45s 分段，长段按 20s 拆开。"""
+    """基于能量切出连续语音段：静音持续超 silence_gap 秒才分段（换气/爆破音的
+    短促停顿不断开），长段按 max_dur 拆开。"""
     win = int(sr * 0.03)
     hop = int(sr * 0.01)
     n = len(y)
@@ -189,16 +191,22 @@ def voice_segments(y, sr, min_dur=MIN_DUR, max_dur=MAX_DUR, silence_gap=0.45):
     rms = np.array([float(np.sqrt((y[i:i + win] ** 2).mean()))
                     for i in range(0, max(n - win, 1), hop)])
     voiced = rms > MIN_RMS
+    gap_frames = max(1, int(round(silence_gap / 0.01)))
     segs = []
-    start = None
+    start = None   # 当前语音段起始帧
+    sil = None     # 当前连续静音的起始帧
     for i, v in enumerate(voiced):
-        t = i * 0.01
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            if t - start * 0.01 > silence_gap:
-                segs.append((start * hop, i * hop))
+        if v:
+            if start is None:
+                start = i
+            sil = None
+        elif start is not None:
+            if sil is None:
+                sil = i
+            if i - sil + 1 >= gap_frames:
+                segs.append((start * hop, sil * hop))
                 start = None
+                sil = None
     if start is not None:
         segs.append((start * hop, n))
     out = []
@@ -251,10 +259,43 @@ def _smooth_join(pieces, sr, fade=0.08):
     return out
 
 
+def _unique_path(p):
+    """目标文件已存在时自动加序号（xxx_2.wav），避免同批同名素材互相覆盖。"""
+    if not os.path.exists(p):
+        return p
+    stem, ext = os.path.splitext(p)
+    k = 1
+    while os.path.exists(p):
+        k += 1
+        p = "%s_%d%s" % (stem, k, ext)
+    return p
+
+
+def _chunk_starts(n, sr, chunk_len, fade_sec=0.5, min_tail_sec=2.0):
+    """长音频分段起点（防段边界爆音）：
+    相邻段起点相差 chunk_len - fade，即两段重叠 fade 秒，拼接时交叉淡化，总长不变；
+    末段不足 min_tail_sec 时并入前一段（前一段略超长，秒级，显存无碍）。"""
+    if n <= chunk_len:
+        return [0]
+    fade = int(fade_sec * sr)
+    step = chunk_len - fade
+    starts = list(range(0, n, step))
+    if len(starts) >= 2 and n - starts[-1] < int(min_tail_sec * sr):
+        starts.pop()
+    return starts
+
+
 def remove_unvoiced_regions(y, sr, min_gap=0.7, keep_pad=0.15):
-    """剪掉无基频的长片段（掌声/欢呼/长停顿）：逐帧 f0 检测，>min_gap 的全剪掉，保留两侧 pad。"""
+    """剪掉无基频的长片段（掌声/欢呼/长停顿）：逐帧 f0 检测，连续超 min_gap 秒
+    判为无声的全剪掉，保留两侧 pad。素材自带背景音乐时音乐带基频会保留，
+    所以带 BGM 的素材要先做人声分离再用本功能。"""
     import parselmouth
-    snd = parselmouth.Sound(y, int(sr))
+    import librosa
+    # 基频分析用 16k 拷贝（长视频省内存、提速），剪切仍按原采样率在原音频上进行
+    ref, ref_sr = y, sr
+    if sr > 16000:
+        ref, ref_sr = librosa.resample(y, orig_sr=sr, target_sr=16000), 16000
+    snd = parselmouth.Sound(ref, int(ref_sr))
     pitch = snd.to_pitch_ac(time_step=0.05, voicing_threshold=0.35,
                             pitch_floor=60, pitch_ceiling=500)
     f0 = pitch.selected_array["frequency"]
@@ -273,7 +314,6 @@ def remove_unvoiced_regions(y, sr, min_gap=0.7, keep_pad=0.15):
         cuts.append((times[start], times[-1]))
     if not cuts:
         return y
-    log("去非人声：剪掉 %d 段（掌声/欢呼/长停顿）" % len(cuts))
     pieces = []
     prev = 0
     pad = keep_pad * sr
@@ -285,7 +325,14 @@ def remove_unvoiced_regions(y, sr, min_gap=0.7, keep_pad=0.15):
         prev = bb
     if prev < len(y):
         pieces.append(y[prev:])
-    return _smooth_join(pieces, sr)
+    out = _smooth_join(pieces, sr)
+    if len(out) < MIN_DUR * sr:
+        # 剪完只剩不到 1.5 秒：多半是误判（整段无人声素材等），放弃剪切保持原样
+        log("去非人声：剪完只剩 %.1f 秒，疑似误判，保持原样" % (len(out) / sr))
+        return y
+    log("去非人声：剪掉 %d 段（掌声/欢呼/长停顿），%.1f 秒 -> %.1f 秒" % (
+        len(cuts), len(y) / sr, len(out) / sr))
+    return out
 
 
 def keep_main_speaker(y, sr, min_seg=1.0, sim_thr=0.45, voiced_thr=0.25):
@@ -318,11 +365,22 @@ def keep_main_speaker(y, sr, min_seg=1.0, sim_thr=0.45, voiced_thr=0.25):
         return cands[0][2]
     E = torch.stack([c[3] for c in cands])
     E = E / E.norm(dim=1, keepdim=True)
-    sim = (E @ E.T).cpu().numpy()
-    center = int(sim.mean(axis=1).argmax())
-    keep = [i for i in range(len(cands)) if sim[center, i] >= sim_thr]
+    # 从最长的段开始贪心聚类：与某簇声纹中心相似度达标归入该簇，否则自立新簇；
+    # 最后保留总说话时长最长的簇（与网页/文档说明一致：按说话时间最长者保留）
+    order = sorted(range(len(cands)), key=lambda i: cands[i][1] - cands[i][0], reverse=True)
+    clusters = []  # [段序号列表, 归一化簇心]
+    for idx in order:
+        for cl in clusters:
+            if float(E[idx] @ cl[1]) >= sim_thr:
+                cl[0].append(idx)
+                center = E[cl[0]].mean(dim=0)
+                cl[1] = center / center.norm()
+                break
+        else:
+            clusters.append([[idx], E[idx]])
+    keep = max(clusters, key=lambda cl: sum(cands[i][1] - cands[i][0] for i in cl[0]))[0]
     if len(keep) < len(cands):
-        log("说话人识别：共 %d 段，保留主要说话人 %d 段，去掉其他说话人 %d 段" % (
+        log("说话人识别：共 %d 段，主要说话人（说话总时长最长）保留 %d 段，去掉 %d 段" % (
             len(cands), len(keep), len(cands) - len(keep)))
     else:
         log("说话人识别：检测到单一说话人，全部保留")
@@ -338,7 +396,7 @@ def process_one(src, task_dir, do_sep, do_reverb, do_speaker, do_denoise, do_boo
     raw_wav = os.path.join(workdir, "input.wav")
     log("提取音频：%s（%.1f 秒）" % (base, duration_sec(src)))
     extract_audio(src, raw_wav)
-    y, sr = sf.read(raw_wav)
+    y, sr = sf.read(raw_wav, dtype="float32")  # 直接 float32，长视频省一半内存
     if y.ndim > 1:
         y = y.mean(axis=1)
     y = np.asarray(y, dtype="float32")
@@ -350,15 +408,19 @@ def process_one(src, task_dir, do_sep, do_reverb, do_speaker, do_denoise, do_boo
         log("人声分离：%s" % base)
         sep = _get_separator()
         chunk_len = MAX_SEC_PER_CHUNK * sr
-        chunks = []
-        for s in range(0, len(y), chunk_len):
-            seg = y[s:s + chunk_len]
-            stems = sep.separate(seg, pbar=False, stems=["vocals"])
+        starts = _chunk_starts(len(y), sr, chunk_len)
+        pieces = []
+        for i, s in enumerate(starts, 1):
+            end = len(y) if i == len(starts) else s + chunk_len
+            if len(starts) > 1:
+                log("人声分离：第 %d/%d 段（%.0f~%.0f 秒）" % (i, len(starts), s / sr, end / sr))
+            stems = sep.separate(y[s:end], pbar=False, stems=["vocals"])
             v = np.asarray(stems["vocals"], dtype="float32")
             if v.ndim > 1:
                 v = v.mean(axis=1)
-            chunks.append(v)
-        y = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+            pieces.append(v)
+        # 相邻段重叠 0.5 秒交叉淡化拼接：消除段边界爆音，总长不变
+        y = _smooth_join(pieces, sr, fade=0.5) if len(pieces) > 1 else pieces[0]
         if _device() == "cuda":
             import torch
             torch.cuda.empty_cache()
@@ -367,9 +429,13 @@ def process_one(src, task_dir, do_sep, do_reverb, do_speaker, do_denoise, do_boo
         log("去混响：%s" % base)
         dereverb = _get_dereverb()
         chunk_len = MAX_SEC_PER_CHUNK * sr
-        chunks = []
-        for s in range(0, len(y), chunk_len):
-            stems = dereverb.separate(y[s:s + chunk_len], pbar=False)
+        starts = _chunk_starts(len(y), sr, chunk_len)
+        pieces = []
+        for i, s in enumerate(starts, 1):
+            end = len(y) if i == len(starts) else s + chunk_len
+            if len(starts) > 1:
+                log("去混响：第 %d/%d 段（%.0f~%.0f 秒）" % (i, len(starts), s / sr, end / sr))
+            stems = dereverb.separate(y[s:end], pbar=False)
             clean = stems.get("noreverb")
             if clean is None:
                 clean = stems.get("vocals")
@@ -378,8 +444,8 @@ def process_one(src, task_dir, do_sep, do_reverb, do_speaker, do_denoise, do_boo
             c = np.asarray(clean, dtype="float32")
             if c.ndim > 1:
                 c = c.mean(axis=1)
-            chunks.append(c)
-        y = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+            pieces.append(c)
+        y = _smooth_join(pieces, sr, fade=0.5) if len(pieces) > 1 else pieces[0]
         if _device() == "cuda":
             import torch
             torch.cuda.empty_cache()
@@ -417,7 +483,7 @@ def process_one(src, task_dir, do_sep, do_reverb, do_speaker, do_denoise, do_boo
         outs = []
         for i, (a, b) in enumerate(segs):
             seg = y[a:b]
-            p = os.path.join(task_dir, "%s_p%02d.wav" % (base, i))
+            p = _unique_path(os.path.join(task_dir, "%s_p%02d.wav" % (base, i)))
             sf.write(p, seg, sr)
             if do_norm:
                 tmp = p + ".tmp.wav"
@@ -426,7 +492,7 @@ def process_one(src, task_dir, do_sep, do_reverb, do_speaker, do_denoise, do_boo
             outs.append(p)
         return outs
 
-    p = os.path.join(task_dir, "%s_clean.wav" % base)
+    p = _unique_path(os.path.join(task_dir, "%s_clean.wav" % base))
     sf.write(p, y, sr)
     if do_norm:
         tmp = p + ".tmp.wav"
@@ -442,26 +508,41 @@ def run_task(files, opts):
     os.makedirs(task_dir, exist_ok=True)
     set_state(task=task_id, task_dir=task_dir, step="开始处理 %d 个文件" % len(files))
     results = []
+    failed = []
     try:
         for i, src in enumerate(files, 1):
-            set_state(step="[%d/%d] 处理 %s" % (i, len(files), os.path.basename(src)))
-            outs = process_one(
-                src, task_dir,
-                do_sep=opts.get("separate", False),
-                do_reverb=opts.get("dereverb", False),
-                do_speaker=opts.get("speaker", False),
-                do_denoise=opts.get("denoise", False),
-                do_boost=opts.get("boost", False),
-                boost_gain=float(opts.get("boost_gain", 2.0)),
-                do_clean=opts.get("clean", False),
-                do_norm=opts.get("normalize", False),
-                sample_rate=int(opts.get("sample_rate", 44100)),
-            )
+            name = os.path.basename(src)
+            try:
+                set_state(step="[%d/%d] 处理 %s" % (i, len(files), name))
+                outs = process_one(
+                    src, task_dir,
+                    do_sep=opts.get("separate", False),
+                    do_reverb=opts.get("dereverb", False),
+                    do_speaker=opts.get("speaker", False),
+                    do_denoise=opts.get("denoise", False),
+                    do_boost=opts.get("boost", False),
+                    boost_gain=float(opts.get("boost_gain", 2.0)),
+                    do_clean=opts.get("clean", False),
+                    do_norm=opts.get("normalize", False),
+                    sample_rate=int(opts.get("sample_rate", 44100)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 单个文件损坏/不支持时跳过它继续跑，不拖死整批
+                logger.exception("处理失败：%s", name)
+                log("✘ [%d/%d] %s 处理失败：%s（已跳过，继续下一个）" % (i, len(files), name, exc))
+                failed.append(name)
+                continue
             for o in outs:
                 results.append({"file": os.path.basename(o), "size": os.path.getsize(o),
                                 "duration": round(duration_sec(o), 1)})
-        set_state(running=False, ok=True, step="全部完成", results=results)
-        log("完成：共输出 %d 个文件 -> %s" % (len(results), task_dir))
+        if failed:
+            set_state(running=False, ok=True, step="全部完成（%d 个文件失败）" % len(failed),
+                      error="完成，但 %d 个文件失败：%s" % (len(failed), "、".join(failed)),
+                      results=results)
+            log("完成（%d 个文件失败）：%d 个输出 -> %s" % (len(failed), len(results), task_dir))
+        else:
+            set_state(running=False, ok=True, step="全部完成", results=results)
+            log("完成：共输出 %d 个文件 -> %s" % (len(results), task_dir))
     except Exception as exc:  # noqa: BLE001
         logger.exception("处理失败")
         set_state(running=False, ok=False, error="处理失败：%s" % exc)
@@ -470,11 +551,40 @@ def run_task(files, opts):
         set_state(running=False)
 
 
-def start_task(files, opts):
-    """原子地开始一个任务：已运行则拒绝，避免并发竞态互相覆盖。"""
+def _remove_any(p):
+    """删除文件或目录（递归），容忍不存在/被占用。"""
+    try:
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            os.remove(p)
+    except OSError:
+        pass
+
+
+def cleanup_old_data(keep_input_dir=None):
+    """「结果不保留」策略：清空上传的原件、处理结果、合并音频、转写 txt。
+    keep_input_dir 传本次任务还要用的上传目录（绝对路径），清理时跳过它。
+    在服务启动时与每个新任务开始时调用；要留的东西请先从页面下载。"""
+    if os.path.isdir(INPUT_ROOT):
+        for name in os.listdir(INPUT_ROOT):
+            p = os.path.join(INPUT_ROOT, name)
+            if keep_input_dir and os.path.abspath(p) == os.path.abspath(keep_input_dir):
+                continue
+            _remove_any(p)
+    for d in (OUTPUT_ROOT, ASR_OUT_ROOT):
+        if os.path.isdir(d):
+            for name in os.listdir(d):
+                _remove_any(os.path.join(d, name))
+
+
+def start_task(files, opts, keep_input_dir=None):
+    """原子地开始一个任务：已运行则拒绝，避免并发竞态互相覆盖；
+    开跑前按「结果不保留」策略清掉上一次的上传/结果。"""
     with _task_lock:
         if _state["running"]:
             return False
+        cleanup_old_data(keep_input_dir)
         _state.update(running=True, ok=False, error="", log=[], results=[], task="", step="启动")
     threading.Thread(target=run_task, args=(files, opts), daemon=True).start()
     return True
@@ -557,7 +667,6 @@ def _clean_sensevoice(text):
     """去掉 SenseVoice 输出的 <|zh|><|NEUTRAL|><|Speech|><|withitn|> 等标签。"""
     import re
     text = re.sub(r"<\|[^|]+\|>", "", text or "")
-    text = re.sub(r"^\d+\s*", "", text)
     return text.strip()
 
 
@@ -618,14 +727,12 @@ td,th{border:1px solid #ccc;padding:6px 10px;text-align:left;font-size:14px}
   <label>② 或填服务器上的文件夹路径（直接批量读取该目录所有音视频）</label>
   <input type="text" id="dirpath" placeholder="例如 盘符:\\素材\\视频合集（如 F:\\素材\\视频合集）">
   <label>处理选项（<b>什么都不勾 = 只把视频/音频原样转成 44.1k 单声道 wav，不做任何处理</b>，适合方言/干净录音）</label>
-  <label style="font-weight:400"><input type="checkbox" id="separate"> 人声分离（去背景音乐/伴奏）</label>
-  <label style="font-weight:400"><input type="checkbox" id="dereverb"> 去混响</label>
-  <label style="font-weight:400"><input type="checkbox" id="speaker"> 只保留主要说话人（去掉视频里其他人的声音）</label>
-  <label style="font-weight:400"><input type="checkbox" id="denoise"> 去掌声/欢呼/音效（剪掉无基频的长片段）</label>
+  <label style="font-weight:700"><input type="checkbox" id="separate"> ★ 人声分离（核心功能：去掉背景音乐/伴奏，得到干净人声；干净录音慎用，引擎会轻微变调）</label>
+  <label style="font-weight:400"><input type="checkbox" id="dereverb"> 去混响（房间回声/混响明显时用）</label>
   <label style="font-weight:400"><input type="checkbox" id="boost"> 提高人声音量（人声偏小/录音太远时用）</label>
   <label style="font-weight:400">增益倍数 <input type="number" id="boostGain" value="2" min="1" max="20" step="0.5" style="width:80px">（2 = 音量翻倍）</label>
-  <label style="font-weight:400"><input type="checkbox" id="clean"> 额外生成训练切片（1.5~20 秒一段，可选）</label>
   <label style="font-weight:400"><input type="checkbox" id="normalize"> 响度归一化(-16 LUFS)</label>
+  <label style="font-weight:400;color:#666">常用组合：带 BGM 的视频 → 人声分离 + 去混响；人声偏小 → 再勾「提高人声音量」；干净录音 → 什么都不勾（纯转码）</label>
   <label>输出采样率（训练推荐 44100）</label>
   <select id="sr">
     <option value="44100">44100 Hz（推荐）</option>
@@ -641,7 +748,7 @@ td,th{border:1px solid #ccc;padding:6px 10px;text-align:left;font-size:14px}
   <pre id="log">还没有任务</pre>
 </div>
 <div class="card">
-  <b>处理结果</b>
+  <b>处理结果</b> <span style="color:#888;font-size:13px">结果不保留：开始新任务或重启服务会自动清空（含上传原件），要留着用请先下载</span>
   <div id="result"></div>
 </div>
 <div class="card">
@@ -667,7 +774,7 @@ td,th{border:1px solid #ccc;padding:6px 10px;text-align:left;font-size:14px}
 async function poll(){
   const r = await fetch('/api/status'); const j = await r.json();
   document.getElementById('log').textContent = (j.log||[]).join('\\n') || '还没有任务';
-  document.getElementById('msg').textContent = j.running ? ('处理中：' + (j.step||'')) : (j.ok ? '✔ 处理完成' : (j.error ? '✘ ' + j.error : ''));
+  document.getElementById('msg').textContent = j.running ? ('处理中：' + (j.step||'')) : (j.error ? '⚠ ' + j.error : (j.ok ? '✔ 处理完成' : ''));
   document.getElementById('btn').disabled = !!j.running;
   const rs = document.getElementById('result');
   if (j.results && j.results.length){
@@ -681,6 +788,8 @@ async function poll(){
     });
     h += '</table><br><a href="/api/result/'+j.task+'/zip">⬇ 下载全部结果 zip</a>';
     rs.innerHTML = h;
+  } else if (j.running){
+    rs.innerHTML = '<p style="color:#666">处理中…（结果出来后显示在这里）</p>';
   }
 }
 document.getElementById('btn').onclick = async ()=>{
@@ -689,11 +798,8 @@ document.getElementById('btn').onclick = async ()=>{
   const opts = {
     separate: document.getElementById('separate').checked,
     dereverb: document.getElementById('dereverb').checked,
-    speaker: document.getElementById('speaker').checked,
-    denoise: document.getElementById('denoise').checked,
     boost: document.getElementById('boost').checked,
     boost_gain: parseFloat(document.getElementById('boostGain').value) || 2,
-    clean: document.getElementById('clean').checked,
     normalize: document.getElementById('normalize').checked,
     sample_rate: document.getElementById('sr').value,
   };
@@ -820,18 +926,36 @@ def _collect_folder(dirpath):
 @app.post("/api/process")
 async def process_upload(files: list[UploadFile] = File(...), opts: str = Form("{}")):
     o = json.loads(opts or "{}")
+    ok_files, rejected = [], []
+    for f in files:
+        name = os.path.basename(f.filename or "")
+        if name.lower().endswith(AUDIO_EXTS + VIDEO_EXTS):
+            ok_files.append((f, name))
+        else:
+            rejected.append(name or "(未命名)")
+    if not ok_files:
+        return JSONResponse({"detail": "没有支持的音频/视频文件（支持 wav/mp3/m4a/flac/aac/ogg + mp4/mkv/mov/avi/flv/ts/webm/m4v/wmv）"},
+                            status_code=400)
     task_id = time.strftime("%Y%m%d_%H%M%S")
     up_dir = os.path.join(INPUT_ROOT, task_id)
     os.makedirs(up_dir, exist_ok=True)
     paths = []
-    for f in files:
-        p = os.path.join(up_dir, os.path.basename(f.filename or "file.wav"))
+    for f, name in ok_files:
+        stem, ext = os.path.splitext(name)
+        p = os.path.join(up_dir, name)
+        k = 1
+        while os.path.exists(p):  # 同名素材自动加序号，避免互相覆盖
+            k += 1
+            p = os.path.join(up_dir, "%s_%d%s" % (stem, k, ext))
         with open(p, "wb") as fp:
             shutil.copyfileobj(f.file, fp)
         paths.append(p)
-    if not start_task(paths, o):
+    if not start_task(paths, o, keep_input_dir=up_dir):
         return JSONResponse({"detail": "已有任务在处理中，请稍候再试"}, status_code=400)
-    return {"message": "任务已开始（%d 个文件）" % len(paths)}
+    msg = "任务已开始（%d 个文件）" % len(paths)
+    if rejected:
+        msg += "；已跳过不支持的文件：%s" % "、".join(rejected)
+    return {"message": msg}
 
 
 @app.post("/api/process_dir")
@@ -935,9 +1059,20 @@ def asr_file(ts: str, filename: str):
                         filename=os.path.basename(p))
 
 
+def _clean_asr_out():
+    """转写结果不保留：清掉上次的 txt 文档。"""
+    if os.path.isdir(ASR_OUT_ROOT):
+        for name in os.listdir(ASR_OUT_ROOT):
+            _remove_any(os.path.join(ASR_OUT_ROOT, name))
+
+
 @app.post("/api/asr")
 async def asr_upload(files: list[UploadFile] = File(...)):
     """上传音频/视频 → 语音转文字，返回识别文本（含 txt 文档下载链接）。"""
+    ok_files = [f for f in files
+                if os.path.basename(f.filename or "").lower().endswith(AUDIO_EXTS + VIDEO_EXTS)]
+    if not ok_files:
+        return JSONResponse({"detail": "没有支持的音频/视频文件"}, status_code=400)
     ts = time.strftime("%Y%m%d_%H%M%S")
     up_dir = os.path.join(INPUT_ROOT, ts)
     os.makedirs(up_dir, exist_ok=True)
@@ -945,13 +1080,21 @@ async def asr_upload(files: list[UploadFile] = File(...)):
     results = []
     with _asr_lock:
         try:
-            for f in files:
-                src = os.path.join(up_dir, os.path.basename(f.filename or "file.wav"))
+            _clean_asr_out()
+            for f in ok_files:
+                name = os.path.basename(f.filename or "file.wav")
+                stem, ext = os.path.splitext(name)
+                src = os.path.join(up_dir, name)
+                k = 1
+                while os.path.exists(src):
+                    k += 1
+                    src = os.path.join(up_dir, "%s_%d%s" % (stem, k, ext))
                 with open(src, "wb") as fp:
                     shutil.copyfileobj(f.file, fp)
                 info = transcribe_file(src)
+                os.remove(src)  # 源件用完即删，不保留
                 info["filename"] = os.path.basename(src)
-                info["txt_url"] = _asr_save_txt(ts_dir, os.path.splitext(os.path.basename(src))[0],
+                info["txt_url"] = _asr_save_txt(ts_dir, os.path.splitext(info["filename"])[0],
                                                 info["text"])
                 results.append(info)
         except Exception as exc:  # noqa: BLE001
@@ -970,6 +1113,7 @@ def asr_path(req: dict):
     ts_dir = os.path.join(ASR_OUT_ROOT, ts)
     try:
         with _asr_lock:
+            _clean_asr_out()
             info = transcribe_file(p)
     except Exception as exc:  # noqa: BLE001
         logger.exception("语音转文字失败")
@@ -980,4 +1124,7 @@ def asr_path(req: dict):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, workers=1)
+    # 「结果不保留」：启动时清掉上次的上传原件/处理结果/合并音频/转写 txt，要留的东西请先下载
+    cleanup_old_data()
+    log("已清空历史数据（上传/结果/合并/转写）；结果只保留到下一次任务开始或服务重启")
+    uvicorn.run(app, host=HOST, port=PORT, workers=1)
