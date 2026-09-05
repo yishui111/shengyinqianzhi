@@ -19,11 +19,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import uuid
 import zipfile
+from logging.handlers import RotatingFileHandler
 
 import numpy as np
 import soundfile as sf
@@ -83,7 +85,17 @@ VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".flv", ".ts", ".webm", ".m4v")
 os.makedirs(INPUT_ROOT, exist_ok=True)
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+LOG_DIR = os.path.join(PROJECT_ROOT, "ziliao", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# 日志：同时写文件（后台无窗口运行时靠它排查）与控制台（前台运行时可见）
+_log_handlers = [RotatingFileHandler(os.path.join(LOG_DIR, "service.log"),
+                                     maxBytes=5 * 1024 * 1024, backupCount=2,
+                                     encoding="utf-8")]
+if sys.stderr is not None:  # pythonw 无窗口运行时没有控制台
+    _log_handlers.append(logging.StreamHandler())
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s",
+                    handlers=_log_handlers)
 logger = logging.getLogger("preprocess")
 
 _sep = None
@@ -1124,7 +1136,17 @@ def asr_path(req: dict):
 
 
 if __name__ == "__main__":
+    # pythonw 无窗口运行时没有标准流（sys.stdout/stderr 为 None），库代码碰到就崩：
+    # 统一指向 devnull，保证后台启动与前台行为一致
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     # 「结果不保留」：启动时清掉上次的上传原件/处理结果/合并音频/转写 txt，要留的东西请先下载
     cleanup_old_data()
     log("已清空历史数据（上传/结果/合并/转写）；结果只保留到下一次任务开始或服务重启")
-    uvicorn.run(app, host=HOST, port=PORT, workers=1)
+    try:
+        uvicorn.run(app, host=HOST, port=PORT, workers=1)
+    except Exception:
+        logger.exception("服务启动失败")
+        raise

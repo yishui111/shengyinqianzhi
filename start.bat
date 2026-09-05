@@ -26,13 +26,18 @@ if not exist "%ROOT%runtime\py312\python.exe" (
 echo ============================================
 echo   Voice Material Preprocess
 echo   Web UI  : http://127.0.0.1:%PRE_PORT%/
-echo   Output  : %ROOT%ziliao\output\
+echo   Log     : %ROOT%ziliao\logs\service.log
 echo ============================================
 set "PATH=%ROOT%ffmpeg\bin;%PATH%"
-start "Voice Material Preprocess (port %PRE_PORT%)" "%ROOT%runtime\py312\python.exe" "%ROOT%pre_service\preprocess_api.py"
+rem 后台启动（pythonw 无黑框窗口）：关掉任何窗口都不影响服务，停止请用 stop.bat
+if exist "%ROOT%runtime\py312\pythonw.exe" (
+    start "" "%ROOT%runtime\py312\pythonw.exe" "%ROOT%pre_service\preprocess_api.py"
+) else (
+    start "Voice Material Preprocess (port %PRE_PORT%)" "%ROOT%runtime\py312\python.exe" "%ROOT%pre_service\preprocess_api.py"
+)
 
 echo Waiting for the server to boot ...
-timeout /t 8 /nobreak >nul
+%SystemRoot%\System32\timeout.exe /t 8 /nobreak >nul
 start "" "http://127.0.0.1:%PRE_PORT%/"
 echo Started. Server log is shown in the new console window.
 echo If the browser did not open, visit http://127.0.0.1:%PRE_PORT%/ manually.

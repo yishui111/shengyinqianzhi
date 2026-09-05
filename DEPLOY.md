@@ -92,11 +92,12 @@ ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" -ar 44100 -ac 1 smoke_src.
 ### B.6 启动 / 停止
 
 ```bash
-start.bat        # Windows：一键启动 + 自动打开浏览器 http://127.0.0.1:8070/
+start.bat        # Windows：一键后台启动（pythonw 无黑框窗口）+ 自动打开浏览器 http://127.0.0.1:8070/
 stop.bat         # 一键停止（按端口 8070 精确杀进程，不会误杀其他项目）
 ```
 
-- 原版启动脚本同样可用：`一键启动素材前置处理.bat`（前台运行，日志在同一窗口）/ `关闭素材前置处理.bat`
+- 启动后**没有任何黑框窗口**，关掉任何窗口都不影响服务；运行日志写 `ziliao\logs\service.log`（自动轮转）+ 网页「处理日志」区；
+- 原版启动脚本同样可用：`一键启动素材前置处理.bat`（前台运行，日志在同一控制台窗口，关窗即停）/ `关闭素材前置处理.bat`
 - 手动启动：`python pre_service\preprocess_api.py`
 - 健康检查：浏览器或命令行访问 `GET http://127.0.0.1:8070/api/health`
 
@@ -116,7 +117,7 @@ stop.bat         # 一键停止（按端口 8070 精确杀进程，不会误杀�
 | ---- | ---- |
 | 默认端口 | `8070`（Web UI 与全部 API 同一端口） |
 | 数据目录 | `ziliao\input\`（上传的原始素材，按任务时间分目录）、`ziliao\output\<任务时间>\`（结果 wav）、`ziliao\output\merged\`（「合成一个音频」结果）、`ziliao\asr\<时间戳>\`（语音转文字 txt 文档）。**均不持久保留**：服务启动时与每个新任务开始时自动清空，要留的东西请从页面及时下载 |
-| 日志 | 无独立日志文件：运行日志实时显示在服务控制台 + 网页「处理日志」区（保留最近 600 行） |
+| 日志 | `ziliao\logs\service.log`（自动轮转，单文件 5MB×3）+ 网页「处理日志」区（保留最近 600 行）；`start.bat` 后台启动无控制台，要看前台实时日志用原版「一键启动素材前置处理.bat」 |
 | 配置文件 | 无配置文件；全部通过**环境变量**定制（见下），未设置时用默认值 |
 | 模型目录 | `models\pymss`、`models\speaker`、`models\hf_cache`、`models\asr`（见 B.5） |
 
